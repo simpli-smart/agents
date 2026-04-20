@@ -1,7 +1,8 @@
 from dataclasses import dataclass
-from typing import Literal, TypeVar, Union
+from typing import Any, Literal, TypeAlias, TypeVar
 
-from typing_extensions import TypeAlias
+from pydantic import GetCoreSchemaHandler
+from pydantic_core import CoreSchema, core_schema
 
 ATTRIBUTE_TRANSCRIPTION_SEGMENT_ID = "lk.segment_id"
 ATTRIBUTE_TRANSCRIPTION_TRACK_ID = "lk.transcribed_track_id"
@@ -22,6 +23,18 @@ const { state, ... } = useVoiceAssistant();
 ```
 """
 
+ATTRIBUTE_AGENT_NAME = "lk.agent.name"
+"""
+The name of the agent, stored in the agent's attributes.
+This is set when the agent joins a room and can be used to identify the agent type.
+"""
+
+ATTRIBUTE_SIMULATOR = "lk.simulator"
+"""
+Indicates that the participant is a simulator for testing purposes.
+When set to "true", the agent will skip audio input/output processing.
+"""
+
 TOPIC_CHAT = "lk.chat"
 TOPIC_TRANSCRIPTION = "lk.transcription"
 
@@ -39,14 +52,22 @@ class FlushSentinel:
 
 
 class NotGiven:
+    __slots__ = ()
+
     def __bool__(self) -> Literal[False]:
         return False
 
     def __repr__(self) -> str:
         return "NOT_GIVEN"
 
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        return core_schema.is_instance_schema(cls)
 
-NotGivenOr: TypeAlias = Union[_T, NotGiven]
+
+NotGivenOr: TypeAlias = _T | NotGiven
 NOT_GIVEN = NotGiven()
 
 

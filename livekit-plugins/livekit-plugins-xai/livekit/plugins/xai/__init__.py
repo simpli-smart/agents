@@ -1,10 +1,19 @@
 """xAI plugin for LiveKit Agents"""
 
-from . import realtime
+from . import realtime, responses
+from .tools import FileSearch, WebSearch, XSearch
+from .tts import TTS
+from .types import TTSLanguages
 from .version import __version__
 
 __all__ = [
     "realtime",
+    "responses",
+    "WebSearch",
+    "XSearch",
+    "TTS",
+    "TTSLanguages",
+    "FileSearch",
     "__version__",
 ]
 

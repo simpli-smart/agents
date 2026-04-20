@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
-from typing import Any, Literal, Union, cast
+from typing import Any, Literal, cast
 
 import httpx
 import openai
@@ -24,48 +24,93 @@ from .. import llm
 from .._exceptions import APIConnectionError, APIStatusError, APITimeoutError
 from ..llm import ToolChoice, utils as llm_utils
 from ..llm.chat_context import ChatContext
-from ..llm.tool_context import (
-    FunctionTool,
-    RawFunctionTool,
-    get_raw_function_info,
-    is_function_tool,
-    is_raw_function_tool,
-)
+from ..llm.tool_context import Tool
 from ..log import logger
 from ..types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, APIConnectOptions, NotGivenOr
 from ..utils import is_given
-from ._utils import create_access_token
+from ._utils import create_access_token, get_default_inference_url, get_inference_headers
 
 lk_oai_debug = int(os.getenv("LK_OPENAI_DEBUG", 0))
 
+# Reasoning models don't support sampling parameters.
+# See: https://platform.openai.com/docs/guides/reasoning
+_REASONING_UNSUPPORTED_PARAMS: set[str] = {
+    "temperature",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "n",
+}
+
+# Model prefix -> set of param names that should be dropped
+_UNSUPPORTED_PARAMS: dict[str, set[str]] = {
+    "o1": _REASONING_UNSUPPORTED_PARAMS,
+    "o3": _REASONING_UNSUPPORTED_PARAMS,
+    "o4": _REASONING_UNSUPPORTED_PARAMS,
+    "gpt-5": _REASONING_UNSUPPORTED_PARAMS,
+}
+
+# models that don't support reasoning_effort when function tools are present
+_REASONING_EFFORT_TOOL_INCOMPATIBLE_PREFIXES: set[str] = {"gpt-5.2", "gpt-5.4"}
+
+
+def drop_unsupported_params(
+    model: str, params: dict[str, Any], tools: list[Any] | None = None
+) -> dict[str, Any]:
+    """Remove parameters that are not supported by the given model.
+
+    Strips any provider prefix (e.g. ``openai/o3-pro`` -> ``o3-pro``) before
+    matching against known model prefixes.
+    """
+    model_name = model.split("/")[-1] if "/" in model else model
+    for prefix, unsupported in _UNSUPPORTED_PARAMS.items():
+        if model_name.startswith(prefix):
+            params = {k: v for k, v in params.items() if k not in unsupported}
+            break
+    if tools and any(
+        model_name.startswith(p) for p in _REASONING_EFFORT_TOOL_INCOMPATIBLE_PREFIXES
+    ):
+        params = {k: v for k, v in params.items() if k != "reasoning_effort"}
+    return params
+
 
 OpenAIModels = Literal[
-    "openai/gpt-5",
-    "openai/gpt-5-mini",
-    "openai/gpt-5-nano",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
     "openai/gpt-4.1",
     "openai/gpt-4.1-mini",
     "openai/gpt-4.1-nano",
-    "openai/gpt-4o",
-    "openai/gpt-4o-mini",
+    "openai/gpt-5",
+    "openai/gpt-5-mini",
+    "openai/gpt-5-nano",
+    "openai/gpt-5.1",
+    "openai/gpt-5.1-chat-latest",
+    "openai/gpt-5.2",
+    "openai/gpt-5.2-chat-latest",
+    "openai/gpt-5.3-chat-latest",
+    "openai/gpt-5.4",
     "openai/gpt-oss-120b",
 ]
 
 GoogleModels = Literal[
+    "google/gemini-3-pro",
+    "google/gemini-3-flash",
     "google/gemini-2.5-pro",
     "google/gemini-2.5-flash",
     "google/gemini-2.5-flash-lite",
-    "google/gemini-2.0-flash",
-    "google/gemini-2.0-flash-lite",
 ]
-
-QwenModels = Literal["qwen/qwen3-235b-a22b-instruct"]
 
 KimiModels = Literal["moonshotai/kimi-k2-instruct"]
 
-DeepSeekModels = Literal["deepseek-ai/deepseek-v3"]
+DeepSeekModels = Literal[
+    "deepseek-ai/deepseek-v3",
+    "deepseek-ai/deepseek-v3.2",
+]
 
-LLMModels = Union[OpenAIModels, GoogleModels, QwenModels, KimiModels, DeepSeekModels]
+LLMModels = OpenAIModels | GoogleModels | KimiModels | DeepSeekModels
 
 
 class ChatCompletionOptions(TypedDict, total=False):
@@ -81,6 +126,7 @@ class ChatCompletionOptions(TypedDict, total=False):
     prediction: ChatCompletionPredictionContentParam | None
     presence_penalty: float | None
     prompt_cache_key: str
+    prompt_cache_retention: Literal["in_memory", "24h"] | None
     reasoning_effort: ReasoningEffort | None
     safety_identifier: str
     seed: int | None
@@ -98,9 +144,6 @@ class ChatCompletionOptions(TypedDict, total=False):
     tool_choice: ToolChoice
     # TODO(theomonnomn): support repsonse format
     # response_format: completion_create_params.ResponseFormat
-
-
-DEFAULT_BASE_URL = "https://agent-gateway.livekit.cloud/v1"
 
 
 @dataclass
@@ -126,9 +169,7 @@ class LLM(llm.LLM):
     ) -> None:
         super().__init__()
 
-        lk_base_url = (
-            base_url if base_url else os.environ.get("LIVEKIT_INFERENCE_URL", DEFAULT_BASE_URL)
-        )
+        lk_base_url = base_url if base_url else get_default_inference_url()
 
         lk_api_key = (
             api_key
@@ -170,6 +211,9 @@ class LLM(llm.LLM):
             ),
         )
 
+    async def aclose(self) -> None:
+        await self._client.close()
+
     @classmethod
     def from_model_string(cls, model: str) -> LLM:
         """Create a LLM instance from a model string"""
@@ -188,7 +232,7 @@ class LLM(llm.LLM):
         self,
         *,
         chat_ctx: ChatContext,
-        tools: list[FunctionTool | RawFunctionTool] | None = None,
+        tools: list[Tool] | None = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
@@ -210,7 +254,7 @@ class LLM(llm.LLM):
             extra["parallel_tool_calls"] = parallel_tool_calls
 
         extra_tool_choice = self._opts.extra_kwargs.get("tool_choice", NOT_GIVEN)
-        tool_choice = tool_choice if is_given(tool_choice) else extra_tool_choice  # type: ignore
+        tool_choice = tool_choice if is_given(tool_choice) else extra_tool_choice
         if is_given(tool_choice):
             oai_tool_choice: ChatCompletionToolChoiceOptionParam
             if isinstance(tool_choice, dict):
@@ -245,26 +289,27 @@ class LLM(llm.LLM):
 class LLMStream(llm.LLMStream):
     def __init__(
         self,
-        llm: LLM | llm.LLM,
+        llm_v: LLM | llm.LLM,
         *,
         model: LLMModels | str,
         provider: str | None = None,
         strict_tool_schema: bool,
         client: openai.AsyncClient,
         chat_ctx: llm.ChatContext,
-        tools: list[FunctionTool | RawFunctionTool],
+        tools: list[Tool],
         conn_options: APIConnectOptions,
         extra_kwargs: dict[str, Any],
         provider_fmt: str = "openai",  # used internally for chat_ctx format
     ) -> None:
-        super().__init__(llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
+        super().__init__(llm_v, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
         self._model = model
         self._provider = provider
         self._provider_fmt = provider_fmt
         self._strict_tool_schema = strict_tool_schema
         self._client = client
-        self._llm = llm
-        self._extra_kwargs = extra_kwargs
+        self._llm = llm_v
+        self._extra_kwargs = drop_unsupported_params(model, extra_kwargs, tools=tools)
+        self._tool_ctx = llm.ToolContext(tools)
 
     async def _run(self) -> None:
         # current function call that we're waiting for full completion (args are streamed)
@@ -279,17 +324,16 @@ class LLMStream(llm.LLMStream):
 
         try:
             chat_ctx, _ = self._chat_ctx.to_provider_format(format=self._provider_fmt)
-            fnc_ctx = (
-                to_fnc_ctx(self._tools, strict=self._strict_tool_schema)
-                if self._tools
-                else openai.NOT_GIVEN
+            tool_schemas = cast(
+                list[ChatCompletionToolParam],
+                self._tool_ctx.parse_function_tools("openai", strict=self._strict_tool_schema),
             )
             if lk_oai_debug:
                 tool_choice = self._extra_kwargs.get("tool_choice", NOT_GIVEN)
                 logger.debug(
                     "chat.completions.create",
                     extra={
-                        "fnc_ctx": fnc_ctx,
+                        "fnc_ctx": tool_schemas,
                         "tool_choice": tool_choice,
                         "chat_ctx": chat_ctx,
                     },
@@ -298,13 +342,14 @@ class LLMStream(llm.LLMStream):
                 # remove tool_choice from extra_kwargs if no tools are provided
                 self._extra_kwargs.pop("tool_choice", None)
 
+            extra_headers = self._extra_kwargs.setdefault("extra_headers", {})
+            extra_headers.update(get_inference_headers())
             if self._provider:
-                headers = self._extra_kwargs.setdefault("extra_headers", {})
-                headers["X-LiveKit-Inference-Provider"] = self._provider
+                extra_headers["X-LiveKit-Inference-Provider"] = self._provider
 
             self._oai_stream = stream = await self._client.chat.completions.create(
                 messages=cast(list[ChatCompletionMessageParam], chat_ctx),
-                tools=fnc_ctx,
+                tools=tool_schemas or openai.omit,
                 model=self._model,
                 stream_options={"include_usage": True},
                 stream=True,
@@ -325,16 +370,17 @@ class LLMStream(llm.LLMStream):
                         retryable = False
                         tokens_details = chunk.usage.prompt_tokens_details
                         cached_tokens = tokens_details.cached_tokens if tokens_details else 0
-                        chunk = llm.ChatChunk(
+                        usage_chunk = llm.ChatChunk(
                             id=chunk.id,
                             usage=llm.CompletionUsage(
                                 completion_tokens=chunk.usage.completion_tokens,
                                 prompt_tokens=chunk.usage.prompt_tokens,
                                 prompt_cached_tokens=cached_tokens or 0,
                                 total_tokens=chunk.usage.total_tokens,
+                                service_tier=getattr(chunk, "service_tier", None),
                             ),
                         )
-                        self._event_ch.send_nowait(chunk)
+                        self._event_ch.send_nowait(usage_chunk)
 
         except openai.APITimeoutError:
             raise APITimeoutError(retryable=retryable) from None
@@ -433,27 +479,3 @@ class LLMStream(llm.LLMStream):
                 extra=delta_extra,
             ),
         )
-
-
-def to_fnc_ctx(
-    fnc_ctx: list[llm.FunctionTool | llm.RawFunctionTool], *, strict: bool = True
-) -> list[ChatCompletionToolParam]:
-    tools: list[ChatCompletionToolParam] = []
-    for fnc in fnc_ctx:
-        if is_raw_function_tool(fnc):
-            info = get_raw_function_info(fnc)
-            tools.append(
-                {
-                    "type": "function",
-                    "function": info.raw_schema,  # type: ignore
-                }
-            )
-        elif is_function_tool(fnc):
-            schema = (
-                llm.utils.build_strict_openai_schema(fnc)
-                if strict
-                else llm.utils.build_legacy_openai_schema(fnc)
-            )
-            tools.append(schema)  # type: ignore
-
-    return tools

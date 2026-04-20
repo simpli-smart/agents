@@ -13,6 +13,7 @@ from livekit.agents import (
     APIConnectOptions,
     APIStatusError,
     APITimeoutError,
+    LanguageCode,
     NotGivenOr,
 )
 from livekit.agents.stt import stt
@@ -23,7 +24,7 @@ from spitch import AsyncSpitch
 
 @dataclass
 class _STTOptions:
-    language: str
+    language: LanguageCode
 
 
 class STT(stt.STT):
@@ -37,7 +38,7 @@ class STT(stt.STT):
             )
         )
 
-        self._opts = _STTOptions(language=language)
+        self._opts = _STTOptions(language=LanguageCode(language))
         self._client = AsyncSpitch()
 
     @property
@@ -49,11 +50,12 @@ class STT(stt.STT):
         return "Spitch"
 
     def update_options(self, language: str) -> None:
-        self._opts.language = language or self._opts.language
+        self._opts.language = LanguageCode(language) if language else self._opts.language
 
     def _sanitize_options(self, *, language: str | None = None) -> _STTOptions:
         config = dataclasses.replace(self._opts)
-        config.language = language or config.language
+        if language:
+            config.language = LanguageCode(language)
         return config
 
     async def _recognize_impl(
@@ -68,7 +70,7 @@ class STT(stt.STT):
             data = rtc.combine_audio_frames(buffer).to_wav_bytes()
             model = "mansa_v1" if config.language == "en" else "legacy"
             resp = await self._client.speech.transcribe(
-                language=config.language,  # type: ignore
+                language=config.language.language,  # type: ignore
                 content=data,
                 timeout=httpx.Timeout(30, connect=conn_options.timeout),
                 timestamp="word" if "mansa" in model else None,
@@ -79,20 +81,21 @@ class STT(stt.STT):
                 alternatives=[
                     stt.SpeechData(
                         text=resp.text or "",
-                        language=config.language or "",
-                        start_time=resp.segments[0].start
-                        if resp.segments and resp.segments[0]
-                        else 0,
-                        end_time=resp.segments[-1].end
-                        if resp.segments and resp.segments[-1]
-                        else 0,
+                        language=LanguageCode(config.language or ""),
+                        start_time=float(resp.segments[0].start)
+                        if resp.segments and resp.segments[0] and resp.segments[0].start
+                        else 0.0,
+                        end_time=float(resp.segments[-1].end)
+                        if resp.segments and resp.segments[-1] and resp.segments[-1].end
+                        else 0.0,
                         words=[
                             TimedString(
-                                text=segment.text,
-                                start_time=segment.start,
-                                end_time=segment.end,
+                                text=str(segment.text) if segment.text else "",
+                                start_time=float(segment.start) if segment.start else 0.0,
+                                end_time=float(segment.end) if segment.end else 0.0,
                             )
                             for segment in resp.segments
+                            if segment is not None
                         ]
                         if resp.segments
                         else None,

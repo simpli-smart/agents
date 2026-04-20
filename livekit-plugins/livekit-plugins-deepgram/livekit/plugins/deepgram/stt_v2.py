@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import weakref
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,7 @@ from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
     APIStatusError,
+    LanguageCode,
     stt,
     utils,
 )
@@ -48,7 +50,7 @@ from .models import V2Models
 class STTOptions:
     model: V2Models | str
     sample_rate: int
-    keyterms: list[str]
+    keyterm: str | Sequence[str]
     endpoint_url: str
     language: str = "en"
     eager_eot_threshold: NotGivenOr[float] = NOT_GIVEN
@@ -67,12 +69,14 @@ class STTv2(stt.STT):
         eager_eot_threshold: NotGivenOr[float] = NOT_GIVEN,
         eot_threshold: NotGivenOr[float] = NOT_GIVEN,
         eot_timeout_ms: NotGivenOr[int] = NOT_GIVEN,
-        keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
+        keyterm: NotGivenOr[str | list[str]] = NOT_GIVEN,
         tags: NotGivenOr[list[str]] = NOT_GIVEN,
         api_key: NotGivenOr[str] = NOT_GIVEN,
         http_session: aiohttp.ClientSession | None = None,
         base_url: str = "wss://api.deepgram.com/v2/listen",
         mip_opt_out: bool = False,
+        # deprecated
+        keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
         """Create a new instance of Deepgram STT.
 
@@ -80,9 +84,9 @@ class STTv2(stt.STT):
             model: The Deepgram model to use for speech recognition. Defaults to "flux-general-en".
             sample_rate: The sample rate of the audio in Hz. Defaults to 16000.
             eager_eot_threshold: The threshold for eager end of turn to enable preemptive generation. Disabled by default. Set to 0.3-0.9 to enable preemptive generation.
-            eot_threshold: The threshold for end of speech detection. Defaults to 0.7.
+            eot_threshold: The threshold for end of speech detection, ranges 0.5-0.9. Defaults to 0.7. If using eager_eot_threshold, set this higher to allow a higher eager value.
             eot_timeout_ms: The timeout for end of speech detection. Defaults to 3000.
-            keyterms: List of key terms to improve recognition accuracy. Defaults to None.
+            keyterm: str or list of str of key terms to improve recognition accuracy. Defaults to None.
             tags: List of tags to add to the requests for usage reporting. Defaults to NOT_GIVEN.
             api_key: Your Deepgram API key. If not provided, will look for DEEPGRAM_API_KEY environment variable.
             http_session: Optional aiohttp ClientSession to use for requests.
@@ -99,7 +103,10 @@ class STTv2(stt.STT):
 
         super().__init__(
             capabilities=stt.STTCapabilities(
-                streaming=True, interim_results=True, aligned_transcript="word"
+                streaming=True,
+                interim_results=True,
+                aligned_transcript="word",
+                offline_recognize=False,
             )
         )
 
@@ -108,10 +115,24 @@ class STTv2(stt.STT):
             raise ValueError("Deepgram API key is required")
         self._api_key = deepgram_api_key
 
+        if is_given(keyterms):
+            logger.warning(
+                "`keyterms` is deprecated, use `keyterm` instead for consistency with Deepgram API."
+            )
+            keyterm = keyterms
+
+        if is_given(eager_eot_threshold):
+            effective_eot = eot_threshold if is_given(eot_threshold) else 0.7
+            if eager_eot_threshold > effective_eot:
+                raise ValueError(
+                    f"eager_eot_threshold ({eager_eot_threshold}) must be less than or equal to eot_threshold "
+                    f"({effective_eot}); increase eot_threshold (max 0.9) to use a higher eager value"
+                )
+
         self._opts = STTOptions(
             model=model,
             sample_rate=sample_rate,
-            keyterms=keyterms if is_given(keyterms) else [],
+            keyterm=keyterm if is_given(keyterm) else [],
             mip_opt_out=mip_opt_out,
             tags=_validate_tags(tags) if is_given(tags) else [],
             eager_eot_threshold=eager_eot_threshold,
@@ -172,11 +193,25 @@ class STTv2(stt.STT):
         eager_eot_threshold: NotGivenOr[float] = NOT_GIVEN,
         eot_threshold: NotGivenOr[float] = NOT_GIVEN,
         eot_timeout_ms: NotGivenOr[int] = NOT_GIVEN,
-        keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
+        keyterm: NotGivenOr[str | list[str]] = NOT_GIVEN,
         mip_opt_out: NotGivenOr[bool] = NOT_GIVEN,
         tags: NotGivenOr[list[str]] = NOT_GIVEN,
         endpoint_url: NotGivenOr[str] = NOT_GIVEN,
+        # deprecated
+        keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
+        effective_eager = (
+            eager_eot_threshold if is_given(eager_eot_threshold) else self._opts.eager_eot_threshold
+        )
+        effective_eot = (
+            eot_threshold
+            if is_given(eot_threshold)
+            else (self._opts.eot_threshold if is_given(self._opts.eot_threshold) else 0.7)
+        )
+        if is_given(effective_eager) and effective_eager > effective_eot:
+            raise ValueError(
+                f"eager_eot_threshold ({effective_eager}) must be less than or equal to eot_threshold ({effective_eot})"
+            )
         if is_given(model):
             self._opts.model = model
         if is_given(sample_rate):
@@ -186,7 +221,12 @@ class STTv2(stt.STT):
         if is_given(eot_timeout_ms):
             self._opts.eot_timeout_ms = eot_timeout_ms
         if is_given(keyterms):
-            self._opts.keyterms = keyterms
+            logger.warning(
+                "`keyterms` is deprecated, use `keyterm` instead for consistency with Deepgram API."
+            )
+            keyterm = keyterms
+        if is_given(keyterm):
+            self._opts.keyterm = keyterm
         if is_given(mip_opt_out):
             self._opts.mip_opt_out = mip_opt_out
         if is_given(tags):
@@ -202,7 +242,7 @@ class STTv2(stt.STT):
                 sample_rate=sample_rate,
                 eot_threshold=eot_threshold,
                 eot_timeout_ms=eot_timeout_ms,
-                keyterms=keyterms,
+                keyterm=keyterm,
                 mip_opt_out=mip_opt_out,
                 endpoint_url=endpoint_url,
                 tags=tags,
@@ -246,11 +286,13 @@ class SpeechStreamv2(stt.SpeechStream):
         sample_rate: NotGivenOr[int] = NOT_GIVEN,
         eot_threshold: NotGivenOr[float] = NOT_GIVEN,
         eot_timeout_ms: NotGivenOr[int] = NOT_GIVEN,
-        keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
+        keyterm: NotGivenOr[str | list[str]] = NOT_GIVEN,
         mip_opt_out: NotGivenOr[bool] = NOT_GIVEN,
         tags: NotGivenOr[list[str]] = NOT_GIVEN,
         endpoint_url: NotGivenOr[str] = NOT_GIVEN,
         eager_eot_threshold: NotGivenOr[float] = NOT_GIVEN,
+        # deprecated
+        keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
         if is_given(model):
             self._opts.model = model
@@ -261,7 +303,12 @@ class SpeechStreamv2(stt.SpeechStream):
         if is_given(eot_timeout_ms):
             self._opts.eot_timeout_ms = eot_timeout_ms
         if is_given(keyterms):
-            self._opts.keyterms = keyterms
+            logger.warning(
+                "`keyterms` is deprecated, use `keyterm` instead for consistency with Deepgram API."
+            )
+            keyterm = keyterms
+        if is_given(keyterm):
+            self._opts.keyterm = keyterm
         if is_given(mip_opt_out):
             self._opts.mip_opt_out = mip_opt_out
         if is_given(tags):
@@ -336,7 +383,11 @@ class SpeechStreamv2(stt.SpeechStream):
                         return
 
                     # this will trigger a reconnection, see the _run loop
-                    raise APIStatusError(message="deepgram connection closed unexpectedly")
+                    raise APIStatusError(
+                        message="deepgram connection closed unexpectedly",
+                        status_code=ws.close_code or -1,
+                        body=f"{msg.data=} {msg.extra=}",
+                    )
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     logger.warning("unexpected deepgram message type %s", msg.type)
@@ -399,10 +450,8 @@ class SpeechStreamv2(stt.SpeechStream):
         if self._opts.eot_timeout_ms:
             live_config["eot_timeout_ms"] = self._opts.eot_timeout_ms
 
-        if self._opts.keyterms:
-            # the query param is `keyterm`
-            # See: https://developers.deepgram.com/docs/keyterm
-            live_config["keyterm"] = self._opts.keyterms
+        if self._opts.keyterm:
+            live_config["keyterm"] = self._opts.keyterm
 
         if self._opts.tags:
             live_config["tag"] = self._opts.tags
@@ -512,7 +561,7 @@ def _parse_transcription(
     confidence = sum(word["confidence"] for word in words) / len(words) if words else 0
 
     sd = stt.SpeechData(
-        language=language,
+        language=LanguageCode(language),
         start_time=data.get("audio_window_start", 0) + start_time_offset,
         end_time=data.get("audio_window_end", 0) + start_time_offset,
         confidence=confidence,
@@ -522,6 +571,7 @@ def _parse_transcription(
                 text=word.get("word", ""),
                 start_time=word.get("start", 0) + start_time_offset,
                 end_time=word.get("end", 0) + start_time_offset,
+                confidence=word["confidence"],
                 start_time_offset=start_time_offset,
             )
             for word in words
